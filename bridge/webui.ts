@@ -48,10 +48,13 @@ class WebuiBridge {
 	#callPromiseID: Uint16Array = new Uint16Array(1);
 	#callPromiseResolve: (((data: string) => unknown) | undefined)[] = [];
 	#allowNavigation: boolean = true;
-	#sendQueue: Uint8Array[] = [];
-	#isSending: boolean = false;
-	#bindsList: string[] = [];
+	#bindsList: Set<string> = new Set();
 	#bindsListTimeout: number = 10000;
+	#tokenWaiters: { resolve: (ok: boolean) => void; timer: number }[] = [];
+	// Shared codecs (kept as members, the bundle is a classic script and top-level names would be globals)
+	#encoder: TextEncoder = new TextEncoder();
+	#decoder: TextDecoder = new TextDecoder();
+	#pingPacket: Uint8Array = new TextEncoder().encode('ping');
 	// WebUI Const
 	#WEBUI_SIGNATURE: number = 221;
 	#CMD_JS: number = 254;
@@ -180,7 +183,7 @@ class WebuiBridge {
 			document.addEventListener("mousedown", (e) => {
 				this.#isDragging = false;
 				this.#dragArmed = (e.button === 0) && (resolveRegion(e.target as Element | null) === "drag");
-			});
+			}, { passive: true });
 			document.addEventListener("mousemove", (e) => {
 				if (e.buttons !== 1) {
 					this.#dragArmed = false;
@@ -191,7 +194,7 @@ class WebuiBridge {
 					this.#isDragging = true;
 					this.#sendDrag();
 				}
-			});
+			}, { passive: true });
 			document.addEventListener("mouseup", () => {
 				this.#dragArmed = false;
 				this.#isDragging = false;
@@ -269,18 +272,33 @@ class WebuiBridge {
 			return {x: 0, y: 0, width: 0, height: 0};
 		}
 	}
+	#getDataStrEnd(buffer: Uint8Array, startIndex: number): number {
+		// Index of the null terminator, or the buffer end
+		const end = buffer.indexOf(0, startIndex);
+		return end === -1 ? buffer.length : end;
+	}
 	#getDataStrFromPacket(buffer: Uint8Array, startIndex: number): string {
-		let stringBytes: number[] = [];
-		for (let i = startIndex; i < buffer.length; i++) {
-			if (buffer[i] === 0) {
-				// Check for null byte
-				break;
-			}
-			stringBytes.push(buffer[i]);
-		}
-		// Convert the array of bytes to a string
-		const stringText = new TextDecoder().decode(new Uint8Array(stringBytes));
-		return stringText;
+		return this.#decoder.decode(buffer.subarray(startIndex, this.#getDataStrEnd(buffer, startIndex)));
+	}
+	// Allocate a packet with its header filled, `dataLen` bytes of zeroed data follow
+	#newPacket(cmd: number, id: number, dataLen: number): Uint8Array {
+		// Protocol
+		// 0: [SIGNATURE]
+		// 1: [TOKEN] Little-endian
+		// 2: [ID] Little-endian
+		// 3: [CMD]
+		// 4: [Data]
+		const packet = new Uint8Array(this.#PROTOCOL_SIZE + dataLen);
+		const token = this.#token;
+		packet[this.#PROTOCOL_SIGN] = this.#WEBUI_SIGNATURE;
+		packet[this.#PROTOCOL_TOKEN] = token & 0xff;
+		packet[this.#PROTOCOL_TOKEN + 1] = (token >>> 8) & 0xff;
+		packet[this.#PROTOCOL_TOKEN + 2] = (token >>> 16) & 0xff;
+		packet[this.#PROTOCOL_TOKEN + 3] = (token >>> 24) & 0xff;
+		packet[this.#PROTOCOL_ID] = id & 0xff;
+		packet[this.#PROTOCOL_ID + 1] = (id >>> 8) & 0xff;
+		packet[this.#PROTOCOL_CMD] = cmd;
+		return packet;
 	}
 	#getID(buffer: Uint8Array, index: number): number {
 		if (index < 0 || index >= buffer.length - 1) {
@@ -290,30 +308,6 @@ class WebuiBridge {
 		const secondByte = buffer[index + 1];
 		const combined = (secondByte << 8) | firstByte; // Works only for little-endian
 		return combined;
-	}
-	#addToken(buffer: Uint8Array, value: number, index: number): void {
-		if (value < 0 || value > 0xffffffff) {
-			throw new Error('Number is out of the range for 4 bytes representation.');
-		}
-		if (index < 0 || index > buffer.length - 4) {
-			throw new Error('Index out of bounds or insufficient space in buffer.');
-		}
-		// WebUI expect Little-endian (Work for Little/Big endian platforms)
-		buffer[index] = value & 0xff; // Least significant byte
-		buffer[index + 1] = (value >>> 8) & 0xff;
-		buffer[index + 2] = (value >>> 16) & 0xff;
-		buffer[index + 3] = (value >>> 24) & 0xff; // Most significant byte
-	}
-	#addID(buffer: Uint8Array, value: number, index: number): void {
-		if (value < 0 || value > 0xffff) {
-			throw new Error('Number is out of the range for 2 bytes representation.');
-		}
-		if (index < 0 || index > buffer.length - 2) {
-			throw new Error('Index out of bounds or insufficient space in buffer.');
-		}
-		// WebUI expect Little-endian (Work for Little/Big endian platforms)
-		buffer[index] = value & 0xff; // Least significant byte
-		buffer[index + 1] = (value >>> 8) & 0xff; // Most significant byte
 	}
 	#start() {
 		this.#keepAlive();
@@ -326,7 +320,7 @@ class WebuiBridge {
 			if (this.#Ping) {
 				// Some web browsers may close the connection
 				// let's send a void message to keep WS open
-				this.#sendData(new TextEncoder().encode('ping'));
+				this.#sendData(this.#pingPacket);
 			} else {
 				// There is an active communication
 				this.#Ping = true;
@@ -335,56 +329,40 @@ class WebuiBridge {
 		}
 	};
 	#clicksListener() {
-		document.querySelectorAll<HTMLElement>("[id]").forEach(e => {
-			if (this.#AllEvents || ((e.id !== '') && (this.#bindsList.includes(e.id)))) {
-				if (e.id && !e.dataset.webui_click_is_set) {
-					e.dataset.webui_click_is_set = "true";
-					e.addEventListener("click", () => this.#sendClick(e.id));
+		const elements = document.querySelectorAll<HTMLElement>("[id]");
+		for (let i = 0; i < elements.length; i++) {
+			const e = elements[i];
+			const id = e.id;
+			if (id === '') continue;
+			if (this.#AllEvents || this.#bindsList.has(id)) {
+				if (!e.hasAttribute('data-webui_click_is_set')) {
+					e.setAttribute('data-webui_click_is_set', 'true');
+					e.addEventListener("click", () => this.#sendClick(id));
 				}
 			}
-		});
+		}
 	}
-	async #sendData(packet: Uint8Array) {
+	#sendData(packet: Uint8Array) {
 		this.#Ping = false;
 		if ((!this.#wsIsConnected()) || packet === undefined) return;
-		// Enqueue the packet
-		this.#sendQueue.push(packet);
-		if (this.#isSending) return;
-		this.#isSending = true;
-		while (this.#sendQueue.length > 0) {
-			const currentPacket = this.#sendQueue.shift()!;
-			if (currentPacket.length < this.#MULTI_CHUNK_SIZE) {
-				this.#ws.send(currentPacket.buffer);
-			} else {
-				// Pre-packet to let WebUI be ready for multi packet
-				const pre_packet = Uint8Array.of(
-					this.#WEBUI_SIGNATURE,
-					0,
-					0,
-					0,
-					0, // Token (4 Bytes)
-					0,
-					0, // ID (2 Bytes)
-					this.#CMD_MULTI,
-					...new TextEncoder().encode(currentPacket.length.toString()),
-					0,
-				);
-				this.#ws.send(pre_packet.buffer);
-				// Send chunks
-				let offset = 0;
-				const sendChunk = async () => {
-					if (offset < currentPacket.length) {
-						const chunkSize = Math.min(this.#MULTI_CHUNK_SIZE, currentPacket.length - offset);
-						const chunk = currentPacket.subarray(offset, offset + chunkSize);
-						this.#ws.send(chunk);
-						offset += chunkSize;
-						await sendChunk();
-					}
-				};
-				await sendChunk();
-			}
+		// `WebSocket.send()` is synchronous, so a multi packet can't be interleaved
+		if (packet.length < this.#MULTI_CHUNK_SIZE) {
+			this.#ws.send(packet);
+			return;
 		}
-		this.#isSending = false;
+		// Pre-packet to let WebUI be ready for multi packet
+		const size = this.#encoder.encode(packet.length.toString());
+		const pre_packet = this.#newPacket(this.#CMD_MULTI, 0, size.length + 1);
+		pre_packet[this.#PROTOCOL_TOKEN] = 0;
+		pre_packet[this.#PROTOCOL_TOKEN + 1] = 0;
+		pre_packet[this.#PROTOCOL_TOKEN + 2] = 0;
+		pre_packet[this.#PROTOCOL_TOKEN + 3] = 0;
+		pre_packet.set(size, this.#PROTOCOL_DATA);
+		this.#ws.send(pre_packet);
+		// Send chunks
+		for (let offset = 0; offset < packet.length; offset += this.#MULTI_CHUNK_SIZE) {
+			this.#ws.send(packet.subarray(offset, Math.min(offset + this.#MULTI_CHUNK_SIZE, packet.length)));
+		}
 	}
 	#sendClick(elem: string) {
 		if (this.#wsIsConnected()) {
@@ -393,34 +371,10 @@ class WebuiBridge {
 			// 1: [TOKEN]
 			// 2: [ID]
 			// 3: [CMD]
-			// 4: [Element]
-			const packet =
-				elem !== ''
-					? Uint8Array.of(
-							this.#WEBUI_SIGNATURE,
-							0,
-							0,
-							0,
-							0, // Token (4 Bytes)
-							0,
-							0, // ID (2 Bytes)
-							this.#CMD_CLICK,
-							...new TextEncoder().encode(elem),
-							0,
-					  )
-					: Uint8Array.of(
-							this.#WEBUI_SIGNATURE,
-							0,
-							0,
-							0,
-							0, // Token (4 Bytes)
-							0,
-							0, // ID (2 Bytes)
-							this.#CMD_CLICK,
-							0,
-					  );
-			this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-			// this.#addID(packet, 0, this.#PROTOCOL_ID)
+			// 4: [Element, Null]
+			const name = this.#encoder.encode(elem);
+			const packet = this.#newPacket(this.#CMD_CLICK, 0, name.length + 1);
+			packet.set(name, this.#PROTOCOL_DATA);
 			this.#sendData(packet);
 			if (this.#log) console.log(`WebUI -> Send Click [${elem}]`);
 		}
@@ -432,21 +386,8 @@ class WebuiBridge {
 			// 1: [TOKEN]
 			// 2: [ID]
 			// 3: [CMD]
-			const packet =
-				Uint8Array.of(
-					this.#WEBUI_SIGNATURE,
-					0,
-					0,
-					0,
-					0, // Token (4 Bytes)
-					0,
-					0, // ID (2 Bytes)
-					this.#CMD_CHECK_TK,
-					0,
-				);
-			this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-			// this.#addID(packet, 0, this.#PROTOCOL_ID)
-			this.#sendData(packet);
+			// 4: [Null]
+			this.#sendData(this.#newPacket(this.#CMD_CHECK_TK, 0, 1));
 			if (this.#log) console.log(`WebUI -> Send Token [0x${this.#token.toString(16).padStart(8, '0')}]`);
 		}
 	}
@@ -454,25 +395,15 @@ class WebuiBridge {
 		if (url !== '') {
 			if (this.#wsIsConnected()) {
 				if (this.#log) console.log(`WebUI -> Send Navigation Event [${url}]`);
-				const packet = Uint8Array.of(
-					// Protocol
-					// 0: [SIGNATURE]
-					// 1: [TOKEN]
-					// 2: [ID]
-					// 3: [CMD]
-					// 4: [URL]
-					this.#WEBUI_SIGNATURE,
-					0,
-					0,
-					0,
-					0, // Token (4 Bytes)
-					0,
-					0, // ID (2 Bytes)
-					this.#CMD_NAVIGATION,
-					...new TextEncoder().encode(url),
-				);
-				this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-				// this.#addID(packet, 0, this.#PROTOCOL_ID)
+				// Protocol
+				// 0: [SIGNATURE]
+				// 1: [TOKEN]
+				// 2: [ID]
+				// 3: [CMD]
+				// 4: [URL]
+				const bytes = this.#encoder.encode(url);
+				const packet = this.#newPacket(this.#CMD_NAVIGATION, 0, bytes.length);
+				packet.set(bytes, this.#PROTOCOL_DATA);
 				this.#sendData(packet);
 			}
 		}
@@ -481,24 +412,7 @@ class WebuiBridge {
 		if (this.#wsIsConnected()) {
 			if (this.#log) console.log(`WebUI -> Send window drag event`);
 			// Sent once, the backend GTK starts a native window-manager move.
-			const packet = Uint8Array.of(
-				// Protocol
-				// 0: [SIGNATURE]
-				// 1: [TOKEN]
-				// 2: [ID]
-				// 3: [CMD]
-				this.#WEBUI_SIGNATURE,
-				0,
-				0,
-				0,
-				0, // Token (4 Bytes)
-				0,
-				0, // ID (2 Bytes)
-				this.#CMD_WINDOW_DRAG,
-			);
-			this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-			// this.#addID(packet, 0, this.#PROTOCOL_ID)
-			this.#sendData(packet);
+			this.#sendData(this.#newPacket(this.#CMD_WINDOW_DRAG, 0, 0));
 		}
 	}
 	#closeWindowTimer() {
@@ -507,30 +421,38 @@ class WebuiBridge {
 		}, 1000);
 	}
 	#updateBindsList() {
-		if (this.#bindsList.includes('')) {
+		if (this.#bindsList.has('')) {
 			this.#AllEvents = true;
 			this.#allowNavigation = false;
 		}
 		this.#generateCallObjects();
 		this.#clicksListener();
 	}
+	#addBind(bind: string) {
+		// Only the new bind needs a call object, the older ones already have theirs
+		this.#bindsList.add(bind);
+		if (bind === '') {
+			this.#AllEvents = true;
+			this.#allowNavigation = false;
+		}
+		this.#defineCallObject(bind);
+		this.#clicksListener();
+	}
 	#toUint16(value: number): number {
 		return value & 0xffff;
 	}
+	#defineCallObject(fn: string) {
+		if (fn.trim() && fn !== '__webui_core_api__') {
+			if (typeof (window as any)[fn] === 'undefined') {
+				this[fn] = (...args: DataTypes[]) => this.call(fn, ...args);
+				(window as any)[fn] = (...args: string[]) => this.call(fn, ...args);
+				if (this.#log) console.log(`WebUI -> Binding backend function [${fn}]`);
+			}
+		}
+	}
 	#generateCallObjects() {
 		for (const bind of this.#bindsList) {
-			if (bind.trim()) {
-				const fn = bind;
-				if (fn.trim()) {
-					if (fn !== '__webui_core_api__') {
-						if (typeof (window as any)[fn] === 'undefined') {
-							this[fn] = (...args: DataTypes[]) => this.call(fn, ...args);
-							(window as any)[fn] = (...args: string[]) => this.call(fn, ...args);
-							if (this.#log) console.log(`WebUI -> Binding backend function [${fn}]`);
-						}
-					}
-				}
-			}
+			this.#defineCallObject(bind);
 		}
 	}
 	#getScriptUrl() {
@@ -542,58 +464,40 @@ class WebuiBridge {
 	#callPromise(fn: string, ...args: DataTypes[]) {
 		--this.#callPromiseID[0];
 		const callId = this.#toUint16(this.#callPromiseID[0]);
-		// Combine lengths
-		let argsLengths = args
-			.map((arg) => {
-				if (typeof arg === 'object') {
-					// Uint8Array
-					return arg.length;
-				} else {
-					// string, number, boolean
-					return new TextEncoder().encode(arg.toString()).length;
-				}
-			})
-			.join(';');
-		// Combine values
-		let argsValues: Uint8Array = new Uint8Array();
-		for (const arg of args) {
-			let buffer: Uint8Array;
-			if (typeof arg === 'object') {
-				buffer = arg; // Uint8Array
-			} else {
-				// string, number, boolean
-				buffer = new TextEncoder().encode(arg.toString());
-			}
-			const temp = new Uint8Array(argsValues.length + buffer.length + 1);
-			temp.set(argsValues, 0);
-			temp.set(buffer, argsValues.length);
-			temp[argsValues.length + buffer.length] = 0x00;
-			argsValues = temp;
+		// Encode every argument once
+		const fnBytes = this.#encoder.encode(fn);
+		const values: Uint8Array[] = new Array(args.length);
+		const lengths: number[] = new Array(args.length);
+		let valuesSize = 0;
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			// Uint8Array, or string/number/boolean
+			const buffer = (typeof arg === 'object') ? arg : this.#encoder.encode(arg.toString());
+			values[i] = buffer;
+			lengths[i] = buffer.length;
+			valuesSize += buffer.length + 1;
 		}
+		const lengthsBytes = this.#encoder.encode(lengths.join(';'));
 		// Protocol
 		// 0: [SIGNATURE]
 		// 1: [TOKEN]
 		// 2: [ID]
 		// 3: [CMD]
 		// 4: [Fn, Null, {LenLen...}, Null, {Data,Null,Data,Null...}]
-		let packet = new Uint8Array(0);
-		const packetPush = (data: Uint8Array) => {
-			const newPacket = new Uint8Array(packet.length + data.length);
-			newPacket.set(packet);
-			newPacket.set(data, packet.length);
-			packet = newPacket;
-		};
-		packetPush(new Uint8Array([this.#WEBUI_SIGNATURE]));
-		packetPush(new Uint8Array([0, 0, 0, 0])); // Token (4 Bytes)
-		packetPush(new Uint8Array([0, 0])); // ID (2 Bytes)
-		packetPush(new Uint8Array([this.#CMD_CALL_FUNC]));
-		packetPush(new TextEncoder().encode(fn));
-		packetPush(new Uint8Array([0]));
-		packetPush(new TextEncoder().encode(argsLengths));
-		packetPush(new Uint8Array([0]));
-		packetPush(new Uint8Array(argsValues));
-		this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-		this.#addID(packet, callId, this.#PROTOCOL_ID);
+		const packet = this.#newPacket(
+			this.#CMD_CALL_FUNC,
+			callId,
+			fnBytes.length + 1 + lengthsBytes.length + 1 + valuesSize,
+		);
+		let pos = this.#PROTOCOL_DATA;
+		packet.set(fnBytes, pos);
+		pos += fnBytes.length + 1; // Null
+		packet.set(lengthsBytes, pos);
+		pos += lengthsBytes.length + 1; // Null
+		for (const buffer of values) {
+			packet.set(buffer, pos);
+			pos += buffer.length + 1; // Null
+		}
 		return new Promise((resolve) => {
 			this.#callPromiseResolve[callId] = resolve;
 			this.#sendData(packet);
@@ -606,16 +510,26 @@ class WebuiBridge {
 	#wsIsConnected(): boolean {
 		return ((this.#ws) && (this.#ws.readyState === WebSocket.OPEN));
 	}
-	async #wsWaitForBindsList(): Promise<boolean> {
+	#wsWaitForBindsList(): Promise<boolean> {
 		// The backend can run a script in this page before the token
 		// handshake is done, and the bind list comes with that handshake.
-		const start = Date.now();
-		while (!this.#TokenAccepted) {
-			if (!this.#wsIsConnected()) return false;
-			if ((Date.now() - start) > this.#bindsListTimeout) return false;
-			await new Promise((resolve) => setTimeout(resolve, 10));
+		// Waiters are released by the handshake or by the connection loss.
+		if (!this.#wsIsConnected()) return Promise.resolve(false);
+		if (this.#TokenAccepted) return Promise.resolve(true);
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => this.#wsReleaseWaiters(), this.#bindsListTimeout) as unknown as number;
+			this.#tokenWaiters.push({ resolve, timer });
+		});
+	}
+	#wsReleaseWaiters(): void {
+		const waiters = this.#tokenWaiters;
+		if (waiters.length === 0) return;
+		this.#tokenWaiters = [];
+		const ready = this.#TokenAccepted && this.#wsIsConnected();
+		for (const waiter of waiters) {
+			clearTimeout(waiter.timer);
+			waiter.resolve(ready);
 		}
-		return this.#wsIsConnected();
 	}
 	#wsConnect(): void {
 		if (this.#wsIsConnected()) {
@@ -642,6 +556,7 @@ class WebuiBridge {
 		if (this.#log) console.log(`WebUI -> Connection failed.`);
 	};
 	#wsOnClose = (event: CloseEvent) => {
+		this.#wsReleaseWaiters();
 		if (this.#closeReason === this.#CMD_NAVIGATION) {
 			this.#closeReason = 0;
 			if (this.#log) console.log(`WebUI -> Connection lost. Navigation to [${this.#closeValue}]`);
@@ -693,7 +608,8 @@ class WebuiBridge {
 						// 3: [CMD]
 						// 4: [Script]
 						const script: string = this.#getDataStrFromPacket(buffer8, this.#PROTOCOL_DATA);
-						const scriptSanitize = script.replace(/(?:\r\n|\r|\n)/g, '\n');
+						// Normalize line endings only when needed
+						const scriptSanitize = script.includes('\r') ? script.replace(/(?:\r\n|\r|\n)/g, '\n') : script;
 						if (this.#log) console.log(`WebUI -> CMD -> JS [${scriptSanitize}]`);
 						// Get callback result
 						let FunReturn: string | Uint8Array = 'undefined';
@@ -725,7 +641,7 @@ class WebuiBridge {
 								console.log(`WebUI -> CMD -> JS -> Return Success (${binaryData.length} Bytes) [${hexPreview}${binaryData.length > 64 ? '...' : ''}]`);
 							} else {
 								const stringData = String(FunReturn);
-								console.log(`WebUI -> CMD -> JS -> Return Success (${new TextEncoder().encode(stringData).length} Bytes) [${stringData.substring(0, 64)}${stringData.length > 64 ? '...' : ''}]`);
+								console.log(`WebUI -> CMD -> JS -> Return Success (${this.#encoder.encode(stringData).length} Bytes) [${stringData.substring(0, 64)}${stringData.length > 64 ? '...' : ''}]`);
 							}
 						}
 						else if (this.#log && FunError) {
@@ -737,40 +653,13 @@ class WebuiBridge {
 						// 1: [TOKEN]
 						// 2: [ID]
 						// 3: [CMD]
-						// 4: [Error, Script Response]
-						let packet = new Uint8Array(0);
-						const packetPush = (data: Uint8Array) => {
-							const newPacket = new Uint8Array(packet.length + data.length);
-							newPacket.set(packet);
-							newPacket.set(data, packet.length);
-							packet = newPacket;
-						};
-						const packetPushStr = (data: string) => {
-							const chunkSize = 1024 * 8;
-							if (data.length > chunkSize) {
-								const encoder = new TextEncoder();
-								for (let i = 0; i < data.length; i += chunkSize) {
-									const chunk = data.substring(i, Math.min(i + chunkSize, data.length));
-									const encodedChunk = encoder.encode(chunk);
-									packetPush(encodedChunk);
-								}
-							} else {
-								packetPush(new TextEncoder().encode(data));
-							}
-						};
-						packetPush(new Uint8Array([this.#WEBUI_SIGNATURE]));
-						packetPush(new Uint8Array([0, 0, 0, 0])); // Token (4 Bytes)
-						packetPush(new Uint8Array([0, 0])); // ID (2 Bytes)
-						packetPush(new Uint8Array([this.#CMD_JS]));
-						packetPush(new Uint8Array(FunError ? [1] : [0]));
-						if (isBinaryReturn) {
-							packetPush(FunReturn as Uint8Array);
-						} else {
-							packetPushStr(FunReturn as string);
-						}
-						packetPush(new Uint8Array([0]));
-						this.#addToken(packet, this.#token, this.#PROTOCOL_TOKEN);
-						this.#addID(packet, callId, this.#PROTOCOL_ID);
+						// 4: [Error, Script Response, Null]
+						const payload: Uint8Array = isBinaryReturn
+							? (FunReturn as Uint8Array)
+							: this.#encoder.encode(FunReturn as string);
+						const packet = this.#newPacket(this.#CMD_JS, callId, payload.length + 2);
+						packet[this.#PROTOCOL_DATA] = FunError ? 1 : 0;
+						packet.set(payload, this.#PROTOCOL_DATA + 1);
 						this.#sendData(packet);
 					}
 					break;
@@ -829,9 +718,7 @@ class WebuiBridge {
 					// 4: [New Element]
 					const newElement: string = this.#getDataStrFromPacket(buffer8, this.#PROTOCOL_DATA);
 					if (this.#log) console.log(`WebUI -> CMD -> New Bind ID [${newElement}]`);
-					if (!this.#bindsList.includes(newElement)) this.#bindsList.push(newElement);
-					// Generate objects
-					this.#updateBindsList();
+					this.#addBind(newElement);
 					break;
 				case this.#CMD_CLOSE:
 					// Protocol
@@ -868,9 +755,11 @@ class WebuiBridge {
 						// Get binds list (CSV)
 						let csv: string = this.#getDataStrFromPacket(buffer8, this.#PROTOCOL_DATA + 1);
 						csv = csv.endsWith(',') ? csv.slice(0, -1) : csv;
-						this.#bindsList = csv.split(',');
+						this.#bindsList = new Set(csv.split(','));
 						// Generate objects
 						this.#updateBindsList();
+						// Release the calls waiting for the bind list
+						this.#wsReleaseWaiters();
 						// User event callback
 						this.#userEventCallback(this.event.CONNECTED);
 					}
@@ -895,8 +784,8 @@ class WebuiBridge {
 					// 4: [Function,Null,Raw Data]
 					// Get function name
 					const functionName: string = this.#getDataStrFromPacket(buffer8, this.#PROTOCOL_DATA);
-					// Get the raw data
-					const rawDataIndex: number = this.#PROTOCOL_DATA + functionName.length + 1;
+					// Get the raw data (the name length is in bytes, not in characters)
+					const rawDataIndex: number = this.#getDataStrEnd(buffer8, this.#PROTOCOL_DATA) + 1;
 					const rawDataSize: number = (buffer8.length - rawDataIndex) - 1;
 					const userRawData = buffer8.subarray(rawDataIndex, (rawDataIndex + rawDataSize));
 					if (this.#log) console.log(`WebUI -> CMD -> Received Raw ${rawDataSize} bytes for [${functionName}()]`);
@@ -925,7 +814,7 @@ class WebuiBridge {
 
 		// Check binding list
 		if (fn !== '__webui_core_api__') {
-			if (!this.#AllEvents && !this.#bindsList.includes(`${fn}`))
+			if (!this.#AllEvents && !this.#bindsList.has(`${fn}`))
 				return Promise.reject(new ReferenceError(`No binding was found for "${fn}"`));
 		}
 

@@ -42,6 +42,7 @@
 ## Contents
 
 - [Features](#features)
+- [Performance Improvements](#performance-improvements)
 - [Showcase](#showcase)
 - [UI & The Web Technologies](#ui--the-web-technologies)
 - [Documentation](#documentation)
@@ -65,6 +66,35 @@
 - Uses private profile for safety
 - Cross-platform WebView (*Optional*)
 
+## Performance Improvements
+
+This fork focuses on the latency of the C ⇄ JavaScript round trip.
+
+**Backend (`src/webui.c`)**
+
+- `webui_script()` / `webui_run()` and the asynchronous-response waits no longer poll with `Sleep(1)` / `Sleep(10)` (about 15 ms per wait on Windows). They now block on condition variables that are signaled as soon as the result arrives or the client disconnects.
+
+**Bridge (`bridge/webui.ts`)**
+
+- Packets are built with a single allocation instead of repeated reallocation (quadratic on large payloads), and every argument is encoded once.
+- Incoming strings are decoded straight from the packet instead of byte by byte.
+- Sending is synchronous (no async queue), and the `TextEncoder`/`TextDecoder` instances are reused.
+- Bindings use a `Set`, new bindings only create their own call object, and the bind-list handshake wait is event-driven instead of a 10 ms poll.
+- Fixes: a non-HTML node in a DOM mutation batch no longer stops listener binding for the remaining nodes (`bridge/utils.ts`), and raw-data packets from functions with non-ASCII names are now parsed correctly.
+
+**Results** (Windows, Edge, `examples/C/latency_benchmark`; the bridge numbers come from a Node/V8 microbenchmark)
+
+| Measurement | Before | After | Gain |
+|---|---|---|---|
+| C → JS `webui_script()` round trip (p50) | ~11 ms | ~0.14 ms | ~75x |
+| `call()` with small args | 8.7 µs | 3.0 µs | 2.9x |
+| `call()` with 5 args, ~60 KB | 241 µs | 70 µs | 3.4x |
+| Decoding a 100 KB response | 4.75 ms | 35 µs | 137x |
+| 1 MB `webui_script()` reply (build + encode) | 12.5 ms | 1.25 ms | 9.9x |
+
+JS → C `webui.call()` improved from ~166–220 µs to ~138–185 µs per call. That path is bound by the WebSocket and the C side, so the gain there is modest.
+
+To reproduce, build `examples/C/latency_benchmark`; it prints p50, p99 and the mean for both directions. To regenerate the bridge after editing `bridge/webui.ts`, see [bridge/README.md](bridge/README.md).
 ## UI & The Web Technologies
 
 [Borislav Stanimirov](https://ibob.bg/) discusses using HTML5 in the web browser as GUI at the [C++ Conference 2019 (_YouTube_)](https://www.youtube.com/watch?v=bbbcZd4cuxg).
