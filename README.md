@@ -24,6 +24,16 @@
 
 </div>
 
+## About FastWebUI
+
+**FastWebUI** is a fork of [WebUI](https://github.com/webui-dev/webui), created by Hassan Draga and the WebUI contributors. It has a single goal: **speed**, specifically the latency of the C ⇄ JavaScript round trip. It adds no features and changes no public API; see [Performance Improvements](#performance-improvements) for what was done and measured.
+
+- **All credit for WebUI belongs to the original project.** Its design, protocol, API, documentation and years of work are what make this fork possible. The extraordinary work of the upstream authors deserves your attention and support: please use, star and contribute to the [original repository](https://github.com/webui-dev/webui) and see its [documentation](https://webui.me/docs.html#/).
+- **Made with the help of AI tools.** All the modifications in this fork were made with the assistance of artificial intelligence tools (GitHub Copilot). They were reviewed and measured, but they have not had the scrutiny of a mature project: validate them for your use case before relying on them.
+- **Same license.** FastWebUI keeps the original [MIT License](LICENSE) and its copyright notice, unchanged.
+- **References to WebUI are intentional.** Names, links, badges and documentation below still refer to WebUI, the original project, because this fork is derived from it. The badges show the status of the upstream repository, not of this fork.
+- If you are not specifically after the latency gains, the upstream project is the better choice. Changes that are not speed-related should go there.
+
 <div align="center">
 
 ![GPT](https://github.com/user-attachments/assets/70455739-94c9-410e-9519-2b0318129b4a)
@@ -41,6 +51,7 @@
 
 ## Contents
 
+- [About FastWebUI](#about-fastwebui)
 - [Features](#features)
 - [Performance Improvements](#performance-improvements)
 - [Showcase](#showcase)
@@ -68,7 +79,7 @@
 
 ## Performance Improvements
 
-This fork focuses on the latency of the C ⇄ JavaScript round trip.
+This fork focuses on the latency of the C ⇄ JavaScript round trip. All of these changes were made with AI assistance (see [About FastWebUI](#about-fastwebui)).
 
 **Backend (`src/webui.c`)**
 
@@ -341,4 +352,4 @@ Think of WebUI like a WebView controller, but instead of embedding the WebView c
 
 ### License
 
-> Licensed under MIT License.
+> Licensed under MIT License. FastWebUI is a derivative of [WebUI](https://github.com/webui-dev/webui), Copyright (c) Hassan Draga, and keeps the original license and copyright notice unchanged (see [LICENSE](LICENSE)).
