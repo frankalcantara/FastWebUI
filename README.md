@@ -2,7 +2,12 @@
 
 ![Logo](https://raw.githubusercontent.com/webui-dev/webui-logo/14fd595844f57ce751dfc751297b1468b10de77a/webui_120.svg)
 
-# WebUI v2.5.0-beta.4
+# FastWebUI
+
+### A speed-focused fork of [WebUI](https://github.com/webui-dev/webui) v2.5.0-beta.4
+
+> [!WARNING]
+> **FastWebUI is a new project.** It has had no time in real-world use, so it has not earned the trust a mature library has. Expect bugs, test it thoroughly, and prefer the [original WebUI](https://github.com/webui-dev/webui) for anything critical.
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/webui-dev/webui/ci.yml?branch=main&style=for-the-badge&logo=githubactions&labelColor=414868&logoColor=C0CAF5
 [last-commit]: https://img.shields.io/github/last-commit/webui-dev/webui?style=for-the-badge&logo=github&logoColor=C0CAF5&labelColor=414868
@@ -30,6 +35,7 @@
 
 - **All credit for WebUI belongs to the original project.** Its design, protocol, API, documentation and years of work are what make this fork possible. The extraordinary work of the upstream authors deserves your attention and support: please use, star and contribute to the [original repository](https://github.com/webui-dev/webui) and see its [documentation](https://webui.me/docs.html#/).
 - **Made with the help of AI tools.** All the modifications in this fork were made with the assistance of artificial intelligence tools (GitHub Copilot). They were reviewed and measured, but they have not had the scrutiny of a mature project: validate them for your use case before relying on them.
+- **New and unproven.** FastWebUI is recent and has no track record in production. The benchmarks below were run on a single Windows machine with Edge only; Linux, macOS, WebView mode and the asynchronous-response paths have not been tested.
 - **Same license.** FastWebUI keeps the original [MIT License](LICENSE) and its copyright notice, unchanged.
 - **References to WebUI are intentional.** Names, links, badges and documentation below still refer to WebUI, the original project, because this fork is derived from it. The badges show the status of the upstream repository, not of this fork.
 - If you are not specifically after the latency gains, the upstream project is the better choice. Changes that are not speed-related should go there.
