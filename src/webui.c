@@ -550,6 +550,8 @@ typedef struct _webui_core_t {
     webui_mutex_t mutex_js_run_id;
     webui_mutex_t mutex_ws_process_number;
     webui_condition_t condition_wait;
+    webui_condition_t condition_js_run; // Paired with `mutex_js_run`
+    webui_condition_t condition_async_response; // Paired with `mutex_async_response`
     char* default_server_root_path;
     bool ui;
     char* custom_browser_folder_path;
@@ -734,6 +736,8 @@ static void _webui_window_free(_webui_window_t* win);
 static void _webui_condition_init(webui_condition_t* cond);
 static void _webui_condition_wait(webui_condition_t* cond, webui_mutex_t* mutex);
 static void _webui_condition_signal(webui_condition_t* cond);
+static void _webui_condition_broadcast(webui_condition_t* cond);
+static void _webui_condition_timedwait(webui_condition_t* cond, webui_mutex_t* mutex, size_t ms);
 static void _webui_condition_destroy(webui_condition_t* cond);
 static void _webui_http_send(_webui_window_t* win, struct mg_connection* client,
     const char* mime_type, const char* body, size_t body_len, bool cache);
@@ -1194,47 +1198,34 @@ bool webui_script_client(webui_event_t* e, const char* script, size_t timeout,
 
     bool js_status = false;
 
-    // Wait for UI response
-    if (timeout < 1 || timeout > 86400) {
-
-        // Wait forever
-        for (;;) {
-            _webui_sleep(1);
-            _webui_mutex_lock(&_webui.mutex_js_run);
-            js_status = _webui.run_done[run_id];
-            _webui_mutex_unlock(&_webui.mutex_js_run);
-            #if __linux__
-            if (_webui.is_webview_mode) {
-                while (gtk_events_pending()) {
-                   gtk_main_iteration_do(0);
-                }
-            }
-            #endif
-            if (js_status)
-                break;
-        }
-    } else {
-
-        // Using timeout
-        _webui_timer_t timer;
+    // Wait for UI response. The result wakes this thread right away,
+    // the short slices only keep the timeout (and the GTK loop) alive.
+    #if __linux__
+    const size_t wait_slice_ms = (_webui.is_webview_mode ? 1 : 50);
+    #else
+    const size_t wait_slice_ms = 50;
+    #endif
+    bool wait_forever = (timeout < 1 || timeout > 86400);
+    _webui_timer_t timer;
+    if (!wait_forever)
         _webui_timer_start(&timer);
-        for (;;) {
-            _webui_sleep(1);
-            _webui_mutex_lock(&_webui.mutex_js_run);
-            js_status = _webui.run_done[run_id];
-            _webui_mutex_unlock(&_webui.mutex_js_run);
-            #if __linux__
-            if (_webui.is_webview_mode) {
-                while (gtk_events_pending()) {
-                   gtk_main_iteration_do(0);
-                }
+    for (;;) {
+        _webui_mutex_lock(&_webui.mutex_js_run);
+        if (!_webui.run_done[run_id])
+            _webui_condition_timedwait(&_webui.condition_js_run, &_webui.mutex_js_run, wait_slice_ms);
+        js_status = _webui.run_done[run_id];
+        _webui_mutex_unlock(&_webui.mutex_js_run);
+        #if __linux__
+        if (_webui.is_webview_mode) {
+            while (gtk_events_pending()) {
+                gtk_main_iteration_do(0);
             }
-            #endif
-            if (js_status)
-                break;
-            if (_webui_timer_is_end(&timer, (timeout * 1000)))
-                break;
         }
+        #endif
+        if (js_status)
+            break;
+        if (!wait_forever && _webui_timer_is_end(&timer, (timeout * 1000)))
+            break;
     }
 
     // Release pipe, so a late result can't write into the buffer. A timed
@@ -4987,6 +4978,7 @@ void webui_interface_set_response_file_handler(size_t window, const void* respon
     if (_webui.config.asynchronous_response) {
         _webui_mutex_lock(&_webui.mutex_async_response);
         win->file_handler_async_done = true;
+        _webui_condition_broadcast(&_webui.condition_async_response);
         _webui_mutex_unlock(&_webui.mutex_async_response);
     }
 }
@@ -5749,6 +5741,7 @@ static void _webui_script_client_closed(struct mg_connection* client) {
             _webui.run_done[i] = true;
         }
     }
+    _webui_condition_broadcast(&_webui.condition_js_run);
     _webui_mutex_unlock(&_webui.mutex_js_run);
 }
 
@@ -5975,8 +5968,10 @@ static void _webui_event_set_response(_webui_window_t* win, size_t event_number,
     if (event_inf != NULL && !event_inf->done) {
         unused_response = event_inf->response;
         event_inf->response = response;
-        if (_webui.config.asynchronous_response)
+        if (_webui.config.asynchronous_response) {
             event_inf->done = true;
+            _webui_condition_broadcast(&_webui.condition_async_response);
+        }
     }
     _webui_mutex_unlock(&_webui.mutex_async_response);
 
@@ -5990,11 +5985,12 @@ static bool _webui_event_wait(webui_event_inf_t* event_inf) {
     if (_webui.config.asynchronous_response) {
         while (true) {
             _webui_mutex_lock(&_webui.mutex_async_response);
+            if (!event_inf->done)
+                _webui_condition_timedwait(&_webui.condition_async_response, &_webui.mutex_async_response, 10);
             bool done = event_inf->done;
             _webui_mutex_unlock(&_webui.mutex_async_response);
             if (done || _webui_mutex_app_is_exit_now(WEBUI_MUTEX_GET_STATUS))
                 break;
-            _webui_sleep(10);
         }
     }
 
@@ -6083,8 +6079,9 @@ static const void* _webui_call_external_file_handler_cb(_webui_window_t* win, co
                 break; // App is exiting, Stop waiting.
             }
 
-            _webui_sleep(10);
             _webui_mutex_lock(&_webui.mutex_async_response);
+            if (!win->file_handler_async_done)
+                _webui_condition_timedwait(&_webui.condition_async_response, &_webui.mutex_async_response, 10);
             if (win->file_handler_async_done) {
                 done = true; // Async response received, Stop waiting.
                 callback_resp = win->file_handler_async_response;
@@ -6518,6 +6515,35 @@ static void _webui_condition_signal(webui_condition_t* cond) {
     WakeConditionVariable(cond);
     #else
     pthread_cond_signal(cond);
+    #endif
+}
+
+static void _webui_condition_broadcast(webui_condition_t* cond) {
+
+    #ifdef _WIN32
+    WakeAllConditionVariable(cond);
+    #else
+    pthread_cond_broadcast(cond);
+    #endif
+}
+
+static void _webui_condition_timedwait(webui_condition_t* cond, webui_mutex_t* mutex, size_t ms) {
+
+    // Returns on a signal, on timeout, or spuriously, so the caller
+    // must check its predicate again. `mutex` must be locked.
+
+    #ifdef _WIN32
+    SleepConditionVariableCS(cond, mutex, (DWORD)ms);
+    #else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(ms / 1000);
+    ts.tv_nsec += (long)((ms % 1000) * 1000000L);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(cond, mutex, &ts);
     #endif
 }
 
@@ -8853,6 +8879,8 @@ static void _webui_clean(void) {
     _webui_mutex_destroy(&_webui.mutex_ws_process_number);
     _webui_mutex_destroy(&_webui.mutex_allocator);
     _webui_condition_destroy(&_webui.condition_wait);
+    _webui_condition_destroy(&_webui.condition_js_run);
+    _webui_condition_destroy(&_webui.condition_async_response);
 
     _webui.initialized = false;
 
@@ -11016,6 +11044,8 @@ static void _webui_init(void) {
     _webui_mutex_init(&_webui.mutex_ws_process_number);
     _webui_mutex_init(&_webui.mutex_allocator);
     _webui_condition_init(&_webui.condition_wait);
+    _webui_condition_init(&_webui.condition_js_run);
+    _webui_condition_init(&_webui.condition_async_response);
 
     // Random
     #ifdef _WIN32
@@ -13137,6 +13167,7 @@ static void _webui_ws_process(
                                 // Send ready signal to webui_script()
                                 _webui.run_error[packet_id] = error;
                                 _webui.run_done[packet_id] = true;
+                                _webui_condition_broadcast(&_webui.condition_js_run);
                             }
 
                             _webui_mutex_unlock(&_webui.mutex_js_run);
